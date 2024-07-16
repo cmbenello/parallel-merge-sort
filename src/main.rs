@@ -158,6 +158,7 @@ impl ExternalSorting {
         // Estimate global quantiles
         let global_quantiles = self.quantiles.estimate_global_quantiles_mean();
         debug!("Global quantiles: {:?}", global_quantiles);
+        println!("Global quantiles: {:?}", global_quantiles);
 
         debug!("Intermediate buffers len: {}", self.intermediate_buffers.len());
 
@@ -379,9 +380,10 @@ fn verify_sorted(output: &[u32]) -> bool {
 fn main() {
     // Initialize logger
     env_logger::init();
-    let file_path = "100.txt";
-    // let input_data = generate_random_input(10_000);
+    let file_path = "100,000,000.txt";
+    // let input_data = generate_random_input(100_000_000);
     // write_input_to_file(&file_path, &input_data).expect("Unable to write input file");
+    // println!("done generating file");
     // Read input from file
     let input_data = read_input_from_file(&file_path).expect("Unable to read input file");
 
@@ -393,7 +395,7 @@ fn main() {
         input: input_data,
         intermediate_buffers: Vec::new(),
         output: TupleBuffer::InMemory(output_buffer),
-        run_size: 10, // Set run size as needed
+        run_size: 10000, // Set run size as needed
         quantiles: Quantiles::new(10), // Set number of quantiles as needed
     };
 
