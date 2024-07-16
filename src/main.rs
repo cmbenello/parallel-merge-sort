@@ -25,6 +25,20 @@ impl TupleBuffer {
             TupleBuffer::OnDisk(buffer) => TupleIterator::OnDisk(buffer.into_iterator()),
         }
     }
+    
+    pub fn get_nth_data(&self, n: usize) -> u32 {
+        match self {
+            TupleBuffer::InMemory(buffer) => buffer.get_nth_data(n),
+            TupleBuffer::OnDisk(buffer) => buffer.get_nth_data(n),
+        }
+    }
+    
+    pub fn get_values(&self, start: u32, end: u32) -> Vec<u32> {
+        match self {
+            TupleBuffer::InMemory(buffer) => buffer.get_values(start, end),
+            TupleBuffer::OnDisk(buffer) => buffer.get_values(start, end),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -69,6 +83,31 @@ impl Quantiles {
 
         self.quantiles.push(quantile_values);
     }
+
+    // This is using the mean
+    pub fn estimate_global_quantiles_mean(&self) -> Vec<u32> {
+        let mut all_quantiles: Vec<u32> = self.quantiles.iter().flatten().cloned().collect();
+        all_quantiles.sort_unstable();
+        let mut global_quantiles = Vec::new();
+        let len = all_quantiles.len();
+        for i in 1..self.num_quantiles {
+            let index = (i * len) / self.num_quantiles;
+            global_quantiles.push(all_quantiles[index]);
+        }
+        global_quantiles
+    }
+
+    // This is using the median
+    pub fn estimate_global_quantiles_median(&self) -> Vec<u32> {
+        let mut global_quantiles = Vec::new();
+        for i in 1..self.num_quantiles {
+            let mut ith_quantiles: Vec<u32> = self.quantiles.iter().map(|q| q[i - 1]).collect();
+            ith_quantiles.sort_unstable();
+            let median = ith_quantiles[ith_quantiles.len() / 2];
+            global_quantiles.push(median);
+        }
+        global_quantiles
+    }
 }
 
 pub struct ExternalSorting {
@@ -95,7 +134,7 @@ impl ExternalSorting {
     pub fn execute(&mut self) {
         // Step 1: Read input and create sorted runs in parallel
         let num_runs = (self.input.len() + self.run_size - 1) / self.run_size;
-        let mut runs: Vec<Vec<u32>> = (0..num_runs)
+        let runs: Vec<Vec<u32>> = (0..num_runs)
             .into_par_iter()
             .map(|i| {
                 let start = i * self.run_size;
@@ -107,7 +146,7 @@ impl ExternalSorting {
             })
             .collect();
 
-        // Compute quantiles for each run
+        // Compute quantiles for each run outside the parallel iterator
         for run in &runs {
             self.quantiles.compute_quantiles(run);
         }
@@ -116,31 +155,44 @@ impl ExternalSorting {
             self.intermediate_buffers.push(TupleBuffer::InMemory(MemoryBuffer::from_vec(run)));
         }
 
+        // Estimate global quantiles
+        let global_quantiles = self.quantiles.estimate_global_quantiles_mean();
+        debug!("Global quantiles: {:?}", global_quantiles);
+
         debug!("Intermediate buffers len: {}", self.intermediate_buffers.len());
 
-        // Step 2: Merge sorted runs
-        while self.intermediate_buffers.len() > 1 {
-            let mut new_buffers = Vec::new();
-            let mut iter = std::mem::take(&mut self.intermediate_buffers).into_iter();
+        // Step 2: Merge sorted runs in parallel based on global quantiles
+        let merged_buffers: Vec<_> = global_quantiles
+            .par_iter()
+            .enumerate()
+            .map(|(i, &quantile)| {
+                let lower_bound = if i == 0 { u32::MIN } else { global_quantiles[i - 1] };
+                let upper_bound = quantile;
+                let mut merged_buffer = MemoryBuffer::new();
 
-            while let Some(first) = iter.next() {
-                if let Some(second) = iter.next() {
-                    let merged_buffer = self.merge_buffers(first, second);
-                    new_buffers.push(merged_buffer);
-                } else {
-                    new_buffers.push(first);
+                debug!("Merging values in range [{}, {})", lower_bound, upper_bound);
+
+                for buffer in &self.intermediate_buffers {
+                    let values = buffer.get_values(lower_bound, upper_bound);
+                    debug!("From buffer {:?}, selected values {:?}", buffer, values);
+                    for value in values {
+                        merged_buffer.push(value);
+                    }
                 }
-            }
 
-            self.intermediate_buffers = new_buffers;
+                merged_buffer
+            })
+            .collect();
+
+        // Collect all merged buffers into the final output
+        let mut final_output = MemoryBuffer::new();
+        for buffer in merged_buffers {
+            for value in buffer.into_iterator() {
+                final_output.push(value);
+            }
         }
 
-        // Step 3: Output the final sorted buffer
-        if let Some(final_buffer) = self.intermediate_buffers.pop() {
-            for tuple in final_buffer.into_iterator() {
-                self.output.push(tuple);
-            }
-        }
+        self.output = TupleBuffer::InMemory(final_output);
     }
 
     fn merge_buffers(&self, buffer1: TupleBuffer, buffer2: TupleBuffer) -> TupleBuffer {
@@ -201,6 +253,14 @@ impl MemoryBuffer {
     pub fn from_vec(data: Vec<u32>) -> Self {
         MemoryBuffer { data }
     }
+    
+    pub fn get_nth_data(&self, n: usize) -> u32 {
+        self.data[n]
+    }
+    
+    pub fn get_values(&self, start: u32, end: u32) -> Vec<u32> {
+        self.data.iter().cloned().filter(|&v| v >= start && v < end).collect()
+    }
 }
 
 #[derive(Debug)]
@@ -240,6 +300,25 @@ impl DiskBuffer {
             file: std::fs::File::open(self.file_path).expect("Unable to open file"),
         }
     }
+    
+    pub fn get_nth_data(&self, n: usize) -> u32 {
+        let file = File::open(&self.file_path).expect("Unable to open file");
+        let reader = BufReader::new(file);
+        reader.lines().nth(n).expect("No data at this position").expect("Failed to read line").parse().expect("Failed to parse value")
+        }
+    
+    pub fn get_values(&self, start: u32, end: u32) -> Vec<u32> {
+        let file = File::open(&self.file_path).expect("Unable to open file");
+        let reader = BufReader::new(file);
+        reader.lines().filter_map(|line| {
+            let value: u32 = line.expect("Failed to read line").parse().expect("Failed to parse value");
+            if value >= start && value < end {
+                Some(value)
+            } else {
+                None
+            }
+        }).collect()
+    }
 }
 
 #[derive(Debug)]
@@ -249,7 +328,6 @@ pub struct DiskIterator {
 
 impl Iterator for DiskIterator {
     type Item = u32;
-
     fn next(&mut self) -> Option<Self::Item> {
         let mut buffer = String::new();
         if let Ok(bytes_read) = self.file.read_to_string(&mut buffer) {
@@ -264,8 +342,7 @@ impl Iterator for DiskIterator {
     }
 }
 
-fn read_input_from_file(file_path: &str) -> io::Result<Vec<u32>> {
-    let file = File::open(file_path)?;
+fn read_input_from_file(file_path: &str) -> io::Result<Vec<u32>> {    let file = File::open(file_path)?;
     let buf_reader = BufReader::new(file);
     let mut input = Vec::new();
     for line in buf_reader.lines() {
@@ -284,8 +361,7 @@ fn write_input_to_file(file_path: &str, data: &[u32]) -> io::Result<()> {
     Ok(())
 }
 
-fn generate_random_input(size: usize) -> Vec<u32> {
-    let mut rng = thread_rng();
+fn generate_random_input(size: usize) -> Vec<u32> {    let mut rng = thread_rng();
     let mut data: Vec<u32> = (1..=size as u32).collect();
     data.shuffle(&mut rng);
     data
@@ -294,7 +370,7 @@ fn generate_random_input(size: usize) -> Vec<u32> {
 fn verify_sorted(output: &[u32]) -> bool {
     for i in 1..output.len() {
         if output[i - 1] > output[i] {
-            return false;
+            false;
         }
     }
     true
@@ -303,8 +379,7 @@ fn verify_sorted(output: &[u32]) -> bool {
 fn main() {
     // Initialize logger
     env_logger::init();
-
-    let file_path = "1,000.txt";
+    let file_path = "100.txt";
     // let input_data = generate_random_input(10_000);
     // write_input_to_file(&file_path, &input_data).expect("Unable to write input file");
     // Read input from file
@@ -318,9 +393,10 @@ fn main() {
         input: input_data,
         intermediate_buffers: Vec::new(),
         output: TupleBuffer::InMemory(output_buffer),
-        run_size: 100, // Set run size as needed
+        run_size: 10, // Set run size as needed
         quantiles: Quantiles::new(10), // Set number of quantiles as needed
     };
+
     // Execute sorting
     sorter.execute();
 
@@ -337,6 +413,4 @@ fn main() {
         }
     }
 
-    // Print quantiles
-    println!("Quantiles: {:?}", sorter.quantiles.quantiles);
 }
